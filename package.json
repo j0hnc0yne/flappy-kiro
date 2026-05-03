@@ -4,6 +4,7 @@
   "description": "Flappy Kiro browser game",
   "type": "module",
   "scripts": {
+    "build": "node scripts/build-docs.js",
     "test": "vitest --run",
     "test:watch": "vitest"
   },
