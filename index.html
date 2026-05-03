@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flappy Kiro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      font-family: 'Press Start 2P', monospace;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+
+  <script type="module">
+    // ─── CONFIG ──────────────────────────────────────────────────────────────
+    // Single source of truth for all tunable constants. No magic numbers
+    // elsewhere in the code.
+    const CONFIG = {
+      // Physics
+      gravity:          0.5,
+      flapVelocity:    -9,
+      terminalVelocity: 12,
+
+      // Ghosty
+      ghostyWidth:   40,
+      ghostyHeight:  40,
+      hitboxInset:    4,
+      bobAmplitude:   8,
+      bobFrequency:   1.5,
+
+      // Pipes
+      basePipeSpeed:   3,
+      maxPipeSpeed:   10,
+      speedIncrement:  0.5,
+      scoreMilestone:  5,
+      pipeSpacing:   280,
+      pipeWidth:      52,
+      gapHeight:     150,
+      minGapMargin:   40,
+
+      // Clouds
+      cloudLayers: {
+        far:  { speedMult: 0.2, opacity: 0.25, count: 4 },
+        mid:  { speedMult: 0.5, opacity: 0.45, count: 3 },
+        near: { speedMult: 0.9, opacity: 0.70, count: 2 },
+      },
+
+      // Visual effects
+      shakeDuration:    400,
+      shakeMaxDisp:       8,
+      particleLifetime: [300, 600],
+      popupDuration:    800,
+
+      // Layout
+      scoreBarHeight: 48,
+      logicalWidth:  480,
+      logicalHeight: 640,
+
+      // Storage
+      highScoreKey: 'flappyKiro_highScore',
+    };
+
+    // ─── STATE ENUM ──────────────────────────────────────────────────────────
+    const STATE = {
+      IDLE:      'idle',
+      PLAYING:   'playing',
+      PAUSED:    'paused',
+      GAME_OVER: 'game_over',
+    };
+
+    // ─── MUTABLE GAME STATE ──────────────────────────────────────────────────
+    const state = {
+      current:   STATE.IDLE,
+      score:     0,
+      highScore: 0,
+
+      ghosty: {
+        x:       CONFIG.logicalWidth * 0.2,
+        y:       CONFIG.logicalHeight / 2,
+        vy:      0,
+        baseY:   CONFIG.logicalHeight / 2,
+        bobTime: 0,
+        width:   CONFIG.ghostyWidth,
+        height:  CONFIG.ghostyHeight,
+      },
+
+      pipes:       [],   // PipePair[]
+      clouds:      [],   // Cloud[]
+      particles:   [],   // Particle[]
+      scorePopups: [],   // ScorePopup[]
+
+      pipeSpeed:    CONFIG.basePipeSpeed,
+      lastPipeX:    0,
+
+      shakeOffset:   { x: 0, y: 0 },
+      shakeDuration: 0,
+      shakeElapsed:  0,
+
+      newHighScore: false,
+
+      // Responsive scaling
+      scale:   1,
+      offsetX: 0,
+      offsetY: 0,
+    };
+
+    // ─── IMAGE LOADING ───────────────────────────────────────────────────────
+
+    // Task 2.1 — Image loader for assets/ghosty.png
+    // Falls back to null (rendered as white rectangle) if load fails.
+    let ghostyImage = null;
+
+    function loadGhostyImage() {
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.addEventListener('load', () => {
+          ghostyImage = img;
+          resolve(img);
+        });
+        img.addEventListener('error', () => {
+          // Silently skip — game continues with white rectangle fallback
+          resolve(null);
+        });
+        img.src = 'assets/ghosty.png';
+      });
+    }
+
+    // ─── AUDIO LOADING ───────────────────────────────────────────────────────
+
+    // Task 2.2 — Audio loader
+    // Loads sound assets into the sounds map; any load error is a silent skip.
+    const sounds = {};
+
+    async function loadAudio() {
+      const assets = [
+        ['jump',      'assets/jump.wav'],
+        ['game_over', 'assets/game_over.wav'],
+        ['score',     'assets/score.wav'],          // optional — may not exist
+        ['music',     'assets/background_music.mp3'], // optional — may not exist
+      ];
+
+      try {
+        for (const [key, src] of assets) {
+          try {
+            const audio = new Audio(src);
+            await new Promise((resolve) => {
+              audio.addEventListener('canplaythrough', resolve, { once: true });
+              audio.addEventListener('error', resolve, { once: true });
+            });
+            sounds[key] = audio;
+          } catch {
+            // Silent skip for this individual asset
+          }
+        }
+      } catch {
+        // Silent skip for entire operation
+      }
+    }
+
+    // ─── AUDIO PLAYBACK ──────────────────────────────────────────────────────
+
+    // Task 2.3 — Audio playback functions
+
+    // Play a one-shot sound by cloning the audio node so overlapping plays work.
+    function playSound(key) {
+      try {
+        if (!sounds[key]) return;
+        const clone = sounds[key].cloneNode();
+        clone.play().catch(() => {});
+      } catch {
+        // Silently ignore autoplay policy errors and any other failures
+      }
+    }
+
+    // Start looping background music.
+    function startMusic() {
+      try {
+        if (!sounds.music) return;
+        sounds.music.loop = true;
+        sounds.music.play().catch(() => {});
+      } catch {
+        // Silently ignore
+      }
+    }
+
+    // Pause background music (e.g. on game pause or game over).
+    function pauseMusic() {
+      try {
+        sounds.music?.pause();
+      } catch {
+        // Silently ignore
+      }
+    }
+
+    // Resume background music after a pause.
+    function resumeMusic() {
+      try {
+        sounds.music?.play().catch(() => {});
+      } catch {
+        // Silently ignore
+      }
+    }
+
+    // ─── CANVAS & SCALING ────────────────────────────────────────────────────────
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    function resizeCanvas() {
+      const W = window.innerWidth  || 1;
+      const H = window.innerHeight || 1;
+      canvas.width  = W;
+      canvas.height = H;
+      const scaleX = W / CONFIG.logicalWidth;
+      const scaleY = H / CONFIG.logicalHeight;
+      state.scale   = Math.min(scaleX, scaleY);
+      state.offsetX = (W - CONFIG.logicalWidth  * state.scale) / 2;
+      state.offsetY = (H - CONFIG.logicalHeight * state.scale) / 2;
+    }
+
+    function toLogical(clientX, clientY) {
+      return {
+        x: (clientX - state.offsetX) / state.scale,
+        y: (clientY - state.offsetY) / state.scale,
+      };
+    }
+
+    window.addEventListener('resize', resizeCanvas);
+
+    // ─── PHYSICS ─────────────────────────────────────────────────────────────
+
+    // Task 4.1 — Apply gravity and update Ghosty's vertical position.
+    // Called each frame while in PLAYING state.
+    // dt is a dimensionless 60fps multiplier (1.0 at 60fps, 2.0 at 30fps).
+    function updateGhosty(dt) {
+      // Apply gravity
+      state.ghosty.vy += CONFIG.gravity * dt;
+      // Clamp to terminal velocity (downward cap)
+      if (state.ghosty.vy > CONFIG.terminalVelocity) {
+        state.ghosty.vy = CONFIG.terminalVelocity;
+      }
+      // Update vertical position
+      state.ghosty.y += state.ghosty.vy * dt;
+    }
+
+    // Task 4.2 — Apply flap: override (not add to) current vertical velocity.
+    // Called on flap input while in PLAYING state.
+    function applyFlap() {
+      state.ghosty.vy = CONFIG.flapVelocity;
+    }
+
+    // Task 4.3 — Idle bobbing animation using a sine wave.
+    // Called each frame while in IDLE state instead of updateGhosty.
+    function updateGhostyBob(dt) {
+      // Accumulate bob time in seconds (dt is frames, divide by 60 to get seconds)
+      state.ghosty.bobTime += dt * (1 / 60);
+      // Set y using sine wave centred on baseY
+      state.ghosty.y = state.ghosty.baseY
+        + Math.sin(state.ghosty.bobTime * CONFIG.bobFrequency * 2 * Math.PI)
+        * CONFIG.bobAmplitude;
+    }
+
+    // ─── PIPE SYSTEM ─────────────────────────────────────────────────────────
+
+    // Return a uniform random gap centre Y within the safe vertical range.
+    // Range: [gapHeight/2 + minGapMargin, logicalHeight − scoreBarHeight − gapHeight/2 − minGapMargin]
+    function randomGapCentre() {
+      const minY = CONFIG.gapHeight / 2 + CONFIG.minGapMargin;
+      const maxY = CONFIG.logicalHeight - CONFIG.scoreBarHeight - CONFIG.gapHeight / 2 - CONFIG.minGapMargin;
+      return minY + Math.random() * (maxY - minY);
+    }
+
+    // Create a new PipePair just off the right edge and push it to state.pipes.
+    function spawnPipe() {
+      const pipe = {
+        x:          CONFIG.logicalWidth + 10,
+        gapCentreY: randomGapCentre(),
+        gapHeight:  CONFIG.gapHeight,
+        width:      CONFIG.pipeWidth,
+        scored:     false,
+      };
+      state.pipes.push(pipe);
+      state.lastPipeX = pipe.x;
+    }
+
+    // Scroll all pipes left, spawn a new pipe when the spacing threshold is met,
+    // and remove pipes that have scrolled fully off the left edge.
+    // dt is a dimensionless 60fps multiplier (1.0 at 60fps, 2.0 at 30fps).
+    function updatePipes(dt) {
+      for (const pipe of state.pipes) {
+        pipe.x -= state.pipeSpeed * dt;
+      }
+
+      const lastPipe = state.pipes[state.pipes.length - 1];
+      const spawnThreshold = lastPipe
+        ? lastPipe.x + CONFIG.pipeSpacing
+        : CONFIG.logicalWidth;
+
+      if (!lastPipe || spawnThreshold <= CONFIG.logicalWidth) {
+        spawnPipe();
+      }
+
+      state.pipes = state.pipes.filter(p => p.x + p.width > 0);
+    }
+
+    // Increase pipe speed when the score hits a milestone.
+    // Speed is capped at CONFIG.maxPipeSpeed.
+    function checkSpeedMilestone() {
+      if (state.score > 0 && state.score % CONFIG.scoreMilestone === 0) {
+        state.pipeSpeed = Math.min(
+          state.pipeSpeed + CONFIG.speedIncrement,
+          CONFIG.maxPipeSpeed
+        );
+      }
+    }
+
+    // Check each pipe to see if Ghosty has passed it.
+    // Increments score, marks the pipe as scored, plays a sound, spawns a score
+    // popup, and triggers a speed milestone check.
+    // Requirements: 7.1, 7.2, 7.3, 13.2
+    function checkScore() {
+      for (const pipe of state.pipes) {
+        if (state.ghosty.x > pipe.x + pipe.width && !pipe.scored) {
+          pipe.scored = true;
+          state.score += 1;
+          playSound('score');
+          spawnScorePopup(pipe.x);
+          checkSpeedMilestone();
+        }
+      }
+    }
+
+    // ─── COLLISION DETECTION ─────────────────────────────────────────────────
+
+    // Return Ghosty's inset AABB (axis-aligned bounding box).
+    // The hitbox is inset by CONFIG.hitboxInset on each side.
+    // Requirements: 6.1
+    function getGhostyBounds() {
+      const inset = CONFIG.hitboxInset;
+      return {
+        left:   state.ghosty.x - state.ghosty.width  / 2 + inset,
+        right:  state.ghosty.x + state.ghosty.width  / 2 - inset,
+        top:    state.ghosty.y - state.ghosty.height / 2 + inset,
+        bottom: state.ghosty.y + state.ghosty.height / 2 - inset,
+      };
+    }
+
+    // Test Ghosty's inset AABB against the screen edges and each pipe's top/bottom
+    // sections. Calls triggerCollision() on the first hit found.
+    // Requirements: 6.1, 6.2, 6.3, 6.4
+    function checkCollision() {
+      const g = getGhostyBounds();
+
+      if (g.top <= 0) {
+        triggerCollision();
+        return;
+      }
+
+      if (g.bottom >= CONFIG.logicalHeight - CONFIG.scoreBarHeight) {
+        triggerCollision();
+        return;
+      }
+
+      for (const pipe of state.pipes) {
+        const topPipeBottom = pipe.gapCentreY - pipe.gapHeight / 2;
+        const bottomPipeTop = pipe.gapCentreY + pipe.gapHeight / 2;
+        const pipeLeft      = pipe.x;
+        const pipeRight     = pipe.x + pipe.width;
+
+        const horizontalOverlap = g.right > pipeLeft && g.left < pipeRight;
+        if (!horizontalOverlap) continue;
+
+        if (g.top < topPipeBottom) {
+          triggerCollision();
+          return;
+        }
+        if (g.bottom > bottomPipeTop) {
+          triggerCollision();
+          return;
+        }
+      }
+    }
+
+    // Transition to GAME_OVER state and trigger all collision side-effects.
+    // Requirements: 6.4, 6.5
+    function triggerCollision() {
+      state.current = STATE.GAME_OVER;
+      playSound('game_over');
+      startScreenShake();
+      pauseMusic();
+      updateHighScore();
+    }
+
+    // ─── HIGH SCORE PERSISTENCE ──────────────────────────────────────────────
+
+    // Load the high score from localStorage.
+    // Returns 0 if the key is missing, the value is not a valid integer,
+    // or localStorage is unavailable.
+    // Requirements: 7.7, 8.8
+    function loadHighScore() {
+      try {
+        const stored = localStorage.getItem(CONFIG.highScoreKey);
+        if (stored === null) return 0;
+        const parsed = parseInt(stored, 10);
+        return Number.isFinite(parsed) ? parsed : 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    // Persist the high score to localStorage.
+    // Silently ignores quota exceeded and unavailable storage errors.
+    // Requirements: 7.6, 8.7
+    function saveHighScore(score) {
+      try {
+        localStorage.setItem(CONFIG.highScoreKey, String(score));
+      } catch {
+        // Quota exceeded or localStorage unavailable — silently ignore.
+      }
+    }
+
+    // Update the high score if the current score exceeds it.
+    // Sets state.newHighScore = true and persists the new value.
+    // Requirements: 7.4, 7.5
+    function updateHighScore() {
+      if (state.score > state.highScore) {
+        state.highScore    = state.score;
+        state.newHighScore = true;
+        saveHighScore(state.highScore);
+      }
+    }
+
+    // ─── VISUAL EFFECTS ──────────────────────────────────────────────────────
+
+    // Start a screen-shake effect.
+    // Requirements: 13.9, 13.10
+    function startScreenShake() {
+      state.shakeDuration = CONFIG.shakeDuration;
+      state.shakeElapsed  = 0;
+    }
+
+    // Update the screen-shake offset each frame.
+    // Accumulates elapsed time (converting dt-frames to ms), computes a
+    // linearly-decaying random displacement, and zeroes the offset when done.
+    // dt is a dimensionless 60fps multiplier (1.0 at 60fps).
+    // Requirements: 13.9, 13.10
+    function updateShake(dt) {
+      if (state.shakeElapsed >= state.shakeDuration) {
+        state.shakeOffset = { x: 0, y: 0 };
+        return;
+      }
+
+      state.shakeElapsed += dt * (1000 / 60);
+
+      if (state.shakeElapsed >= state.shakeDuration) {
+        state.shakeOffset = { x: 0, y: 0 };
+        return;
+      }
+
+      const progress  = state.shakeElapsed / state.shakeDuration;
+      const intensity = (1 - progress) * CONFIG.shakeMaxDisp;
+      state.shakeOffset = {
+        x: (Math.random() * 2 - 1) * intensity,
+        y: (Math.random() * 2 - 1) * intensity,
+      };
+    }
+
+    // Emit a single particle from Ghosty's left edge.
+    // Requirements: 13.11, 13.12
+    function emitParticle() {
+      state.particles.push({
+        x:        state.ghosty.x - state.ghosty.width / 2,
+        y:        state.ghosty.y + (Math.random() - 0.5) * state.ghosty.height * 0.5,
+        vx:       -(Math.random() * 1.5 + 0.5),
+        vy:       (Math.random() - 0.5) * 0.8,
+        radius:   Math.random() * 3 + 2,
+        alpha:    0.8,
+        lifetime: CONFIG.particleLifetime[0] + Math.random() * (CONFIG.particleLifetime[1] - CONFIG.particleLifetime[0]),
+        age:      0,
+        color:    'rgba(200, 200, 255, 1)',
+      });
+    }
+
+    // Update all active particles each frame.
+    // Ages each particle, moves it by its velocity, decays alpha, and removes
+    // expired particles (age >= lifetime).
+    // dt is a dimensionless 60fps multiplier (1.0 at 60fps).
+    // Requirements: 13.12, 13.14
+    function updateParticles(dt) {
+      const dtMs = dt * (1000 / 60);
+      for (const p of state.particles) {
+        p.age   += dtMs;
+        p.x     += p.vx * dt;
+        p.y     += p.vy * dt;
+        p.alpha  = Math.max(0, 1 - p.age / p.lifetime) * 0.8;
+      }
+      state.particles = state.particles.filter(p => p.age < p.lifetime);
+    }
+
+    // Spawn a "+1" score popup near the given pipe x position.
+    // Requirements: 7.3, 13.15
+    function spawnScorePopup(pipeX) {
+      state.scorePopups.push({
+        x:        pipeX,
+        y:        CONFIG.logicalHeight - CONFIG.scoreBarHeight - 20,
+        alpha:    1.0,
+        age:      0,
+        duration: CONFIG.popupDuration,
+      });
+    }
+
+    // Update all active score popups each frame.
+    // Ages each popup, floats it upward, decays alpha, and removes expired
+    // popups (age >= duration).
+    // dt is a dimensionless 60fps multiplier (1.0 at 60fps).
+    // Requirements: 13.16, 13.18
+    function updateScorePopups(dt) {
+      const dtMs = dt * (1000 / 60);
+      for (const p of state.scorePopups) {
+        p.age   += dtMs;
+        p.y     -= 0.5 * dt;
+        p.alpha  = Math.max(0, 1 - p.age / p.duration);
+      }
+      state.scorePopups = state.scorePopups.filter(p => p.age < p.duration);
+    }
+
+    // ─── BACKGROUND TEXTURE ─────────────────────────────────────────────────
+    // Pre-computed sketchy texture lines stored as {x1,y1,x2,y2} objects.
+    // Computed once at init to avoid per-frame randomness.
+    let backgroundLines = [];
+
+    function initBackgroundLines() {
+      backgroundLines = [];
+      const W = CONFIG.logicalWidth;
+      const H = CONFIG.logicalHeight;
+      // Horizontal sketch lines — slightly wavy, spread across the canvas
+      for (let i = 0; i < 40; i++) {
+        const y = Math.random() * H;
+        const x1 = Math.random() * W * 0.3;
+        const x2 = W * 0.6 + Math.random() * W * 0.4;
+        backgroundLines.push({ x1, y1: y, x2, y2: y + (Math.random() - 0.5) * 4 });
+      }
+      // Diagonal sketch lines for texture variety
+      for (let i = 0; i < 20; i++) {
+        const x1 = Math.random() * W;
+        const y1 = Math.random() * H;
+        const len = 30 + Math.random() * 80;
+        const angle = (Math.random() - 0.5) * 0.4; // near-horizontal
+        backgroundLines.push({
+          x1,
+          y1,
+          x2: x1 + Math.cos(angle) * len,
+          y2: y1 + Math.sin(angle) * len,
+        });
+      }
+    }
+
+    // ─── CLOUD SYSTEM ────────────────────────────────────────────────────────
+
+    // Return a random y position within the sky area (above the score bar).
+    function randomCloudY() {
+      const skyHeight = CONFIG.logicalHeight - CONFIG.scoreBarHeight;
+      return Math.random() * skyHeight;
+    }
+
+    // Initialise the cloud array from CONFIG.cloudLayers.
+    // Requirements: 1.3, 9.3, 9.4
+    function initClouds() {
+      state.clouds = [];
+
+      for (const [layerName, layerDef] of Object.entries(CONFIG.cloudLayers)) {
+        const speed   = CONFIG.basePipeSpeed * layerDef.speedMult;
+        const opacity = layerDef.opacity;
+
+        for (let i = 0; i < layerDef.count; i++) {
+          state.clouds.push({
+            x:       Math.random() * CONFIG.logicalWidth,
+            y:       randomCloudY(),
+            width:   60 + Math.random() * 100,
+            height:  30 + Math.random() * 30,
+            layer:   layerName,
+            speed,
+            opacity,
+          });
+        }
+      }
+    }
+
+    // Scroll all clouds left by cloud.speed * dt each frame.
+    // When a cloud scrolls fully off the left edge, it wraps back to just off
+    // the right edge with a re-randomised y position.
+    // dt is a dimensionless 60fps multiplier (1.0 at 60fps, 2.0 at 30fps).
+    // Requirements: 9.3
+    function updateClouds(dt) {
+      for (const cloud of state.clouds) {
+        cloud.x -= cloud.speed * dt;
+
+        if (cloud.x + cloud.width < 0) {
+          cloud.x = CONFIG.logicalWidth + Math.random() * 100;
+          cloud.y = randomCloudY();
+        }
+      }
+    }
+
+    // ─── STATE MACHINE TRANSITIONS ───────────────────────────────────────────
+
+    // Transition to PLAYING state.
+    // Resets Ghosty, clears pipes, resets score/speed, starts music.
+    // Requirements: 3.3, 5.7, 11.5
+    function toPlaying() {
+      state.ghosty.x       = CONFIG.logicalWidth * 0.2;
+      state.ghosty.y       = CONFIG.logicalHeight / 2;
+      state.ghosty.vy      = 0;
+      state.ghosty.bobTime = 0;
+
+      state.pipes     = [];
+      state.score     = 0;
+      state.pipeSpeed = CONFIG.basePipeSpeed;
+
+      state.current = STATE.PLAYING;
+      startMusic();
+    }
+
+    // Transition to PAUSED state. Freezes physics, pauses music.
+    // Requirements: 12.1, 12.2
+    function toPaused() {
+      state.current = STATE.PAUSED;
+      pauseMusic();
+    }
+
+    // Transition to IDLE state.
+    // Resets score, clears pipes, repositions Ghosty, pauses music.
+    // Requirements: 8.6, 11.5
+    function toIdle() {
+      state.current      = STATE.IDLE;
+      state.score        = 0;
+      state.pipes        = [];
+      state.newHighScore = false;
+
+      state.ghosty.x  = CONFIG.logicalWidth * 0.2;
+      state.ghosty.y  = state.ghosty.baseY;
+      state.ghosty.vy = 0;
+
+      pauseMusic();
+    }
+
+    // ─── INPUT HANDLING ──────────────────────────────────────────────────────
+
+    // Track whether music has been started (satisfies autoplay policy —
+    // music must be triggered from a user gesture).
+    let musicStarted = false;
+
+    // Shared flap action: transitions IDLE → PLAYING, flaps in PLAYING,
+    // restarts from GAME_OVER. No-op in PAUSED.
+    // Requirements: 3.1, 3.2, 3.3, 3.6
+    function handleFlap() {
+      if (state.current === STATE.IDLE) {
+        toPlaying();
+        applyFlap();
+        if (!musicStarted) {
+          startMusic();
+          musicStarted = true;
+        }
+        playSound('jump');
+      } else if (state.current === STATE.PLAYING) {
+        applyFlap();
+        if (!musicStarted) {
+          startMusic();
+          musicStarted = true;
+        }
+        playSound('jump');
+      } else if (state.current === STATE.GAME_OVER) {
+        toIdle();
+      }
+      // PAUSED: no-op
+    }
+
+    // Task 13.1 — Keyboard input handler.
+    // Spacebar: flap / restart. Escape/P: toggle pause.
+    // Requirements: 3.1, 3.3, 3.6, 12.1, 12.5, 12.6, 8.6
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault(); // prevent page scroll
+        handleFlap();
+      } else if (e.code === 'Escape' || e.code === 'KeyP') {
+        if (state.current === STATE.PLAYING) {
+          toPaused();
+        } else if (state.current === STATE.PAUSED) {
+          state.current = STATE.PLAYING;
+          resumeMusic();
+        }
+      }
+    });
+
+    // Task 13.2 — Pointer input handlers on canvas.
+    // Click and touchstart apply the same flap/restart logic as keyboard.
+    // startMusic() is called on first flap to satisfy autoplay policy.
+    // Requirements: 3.2, 3.3, 3.6, 13.5
+    canvas.addEventListener('click', (e) => {
+      // toLogical is available but we only need it if we want to restrict
+      // clicks to the logical canvas area; for flap any click on the canvas works.
+      toLogical(e.clientX, e.clientY); // convert (unused here, but validates coords)
+      handleFlap();
+    });
+
+    canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault(); // prevent double-firing with click event
+      const touch = e.changedTouches[0];
+      toLogical(touch.clientX, touch.clientY); // convert (validates coords)
+      handleFlap();
+    }, { passive: false });
+
+    // ─── GAME LOOP ───────────────────────────────────────────────────────────
+
+    // Dispatch per-frame update logic based on the current game state.
+    // dt is a dimensionless 60fps multiplier (1.0 at 60fps, 2.0 at 30fps).
+    // Requirements: 4.1, 4.2, 4.4, 12.2, 12.7, 13.13
+    function update(dt) {
+      if (state.current === STATE.PLAYING) {
+        updateGhosty(dt);
+        updatePipes(dt);
+        checkScore();
+        checkCollision();
+        updateParticles(dt);
+        updateScorePopups(dt);
+        updateClouds(dt);
+        emitParticle();
+        updateShake(dt);
+      } else if (state.current === STATE.IDLE) {
+        updateGhostyBob(dt);
+        updateClouds(dt);
+      } else if (state.current === STATE.PAUSED) {
+        // no-op — all physics frozen
+      } else if (state.current === STATE.GAME_OVER) {
+        updateScorePopups(dt);
+        updateShake(dt);
+      }
+    }
+
+    // ─── RENDERING PIPELINE ──────────────────────────────────────────────────
+
+    // Task 15.1 — Fill with light blue sky; draw pre-computed sketchy texture
+    // lines at low opacity to give a hand-drawn feel.
+    // Requirements: 1.2, 9.1
+    function drawBackground() {
+      ctx.fillStyle = '#87CEEB';
+      ctx.fillRect(0, 0, CONFIG.logicalWidth, CONFIG.logicalHeight);
+
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+      ctx.lineWidth = 1;
+      for (const line of backgroundLines) {
+        ctx.beginPath();
+        ctx.moveTo(line.x1, line.y1);
+        ctx.lineTo(line.x2, line.y2);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // Task 15.2 — Draw all clouds belonging to the given layer as semi-transparent
+    // rounded rectangles. Uses ctx.roundRect when available, falls back to a
+    // manual arc-based path otherwise.
+    // Requirements: 1.3, 9.3, 9.4
+    function drawClouds(layer) {
+      for (const cloud of state.clouds) {
+        if (cloud.layer !== layer) continue;
+
+        ctx.save();
+        ctx.globalAlpha = cloud.opacity;
+        ctx.fillStyle = '#ffffff';
+
+        const x = cloud.x;
+        const y = cloud.y - cloud.height / 2;
+        const w = cloud.width;
+        const h = cloud.height;
+        const r = Math.min(h / 2, 20);
+
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(x, y, w, h, r);
+        } else {
+          // Manual rounded-rect path using arcs
+          ctx.moveTo(x + r, y);
+          ctx.lineTo(x + w - r, y);
+          ctx.arcTo(x + w, y, x + w, y + r, r);
+          ctx.lineTo(x + w, y + h - r);
+          ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+          ctx.lineTo(x + r, y + h);
+          ctx.arcTo(x, y + h, x, y + h - r, r);
+          ctx.lineTo(x, y + r);
+          ctx.arcTo(x, y, x + r, y, r);
+          ctx.closePath();
+        }
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // Task 15.3 — Draw all active pipes.
+    // Each pipe has a green (#4caf50) body and a darker green (#388e3c) cap
+    // with a 4px overhang on each side and 14px cap height.
+    // topPipeBottom and bottomPipeTop are derived from gapCentreY and gapHeight.
+    // Requirements: 5.3, 9.2
+    function drawPipes() {
+      const capHeight   = 14;
+      const capOverhang = 4;
+
+      for (const pipe of state.pipes) {
+        const topPipeBottom = pipe.gapCentreY - pipe.gapHeight / 2;
+        const bottomPipeTop = pipe.gapCentreY + pipe.gapHeight / 2;
+        const x = pipe.x;
+        const w = pipe.width;
+
+        // ── Top pipe ──────────────────────────────────────────────────────
+        // Body: from canvas top down to just above the cap
+        ctx.fillStyle = '#4caf50';
+        ctx.fillRect(x, 0, w, topPipeBottom - capHeight);
+
+        // Cap: slightly wider, sits at the bottom of the top pipe
+        ctx.fillStyle = '#388e3c';
+        ctx.fillRect(x - capOverhang, topPipeBottom - capHeight, w + capOverhang * 2, capHeight);
+
+        // ── Bottom pipe ───────────────────────────────────────────────────
+        // Cap: sits at the top of the bottom pipe
+        ctx.fillStyle = '#388e3c';
+        ctx.fillRect(x - capOverhang, bottomPipeTop, w + capOverhang * 2, capHeight);
+
+        // Body: from below the cap down to the score bar
+        ctx.fillStyle = '#4caf50';
+        ctx.fillRect(x, bottomPipeTop + capHeight, w, CONFIG.logicalHeight - CONFIG.scoreBarHeight - bottomPipeTop - capHeight);
+      }
+    }
+
+    // Task 15.4 — Draw Ghosty centred on ghosty.x / ghosty.y.
+    // Falls back to a white rectangle if the image failed to load.
+    // Requirements: 1.5
+    function drawGhosty() {
+      const { x, y, width, height } = state.ghosty;
+      const drawX = x - width  / 2;
+      const drawY = y - height / 2;
+
+      if (ghostyImage) {
+        ctx.drawImage(ghostyImage, drawX, drawY, width, height);
+      } else {
+        // Fallback: white rectangle
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(drawX, drawY, width, height);
+      }
+    }
+
+    // Task 15.5 — Draw each particle as a filled circle using its current alpha.
+    // Requirements: 13.12
+    function drawParticles() {
+      for (const p of state.particles) {
+        ctx.save();
+        ctx.globalAlpha = p.alpha;
+        ctx.fillStyle   = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // Task 15.6 — Draw "+1" text at each popup's position with current alpha.
+    // Uses a bright yellow colour for high contrast against the background.
+    // Requirements: 7.3, 13.15, 13.16, 13.17
+    function drawScorePopups() {
+      ctx.save();
+      ctx.font      = '16px "Press Start 2P", monospace';
+      ctx.textAlign = 'center';
+
+      for (const p of state.scorePopups) {
+        ctx.globalAlpha = p.alpha;
+        // Bright yellow outline for contrast
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.lineWidth   = 3;
+        ctx.strokeText('+1', p.x, p.y);
+        // Bright yellow fill
+        ctx.fillStyle = '#FFE600';
+        ctx.fillText('+1', p.x, p.y);
+      }
+      ctx.restore();
+    }
+
+    // Task 15.7 — Draw the score bar: dark filled rectangle spanning the full
+    // logical width at the bottom, with "Score: X | High: X" in white pixel font.
+    // Requirements: 1.4, 7.2, 9.5, 9.6, 9.7
+    function drawScoreBar() {
+      const barY = CONFIG.logicalHeight - CONFIG.scoreBarHeight;
+
+      // Dark background bar
+      ctx.fillStyle = 'rgba(20, 20, 30, 0.92)';
+      ctx.fillRect(0, barY, CONFIG.logicalWidth, CONFIG.scoreBarHeight);
+
+      // Score text
+      ctx.save();
+      ctx.font         = '14px "Press Start 2P", monospace';
+      ctx.fillStyle    = '#ffffff';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(
+        `Score: ${state.score}  |  High: ${state.highScore}`,
+        CONFIG.logicalWidth / 2,
+        barY + CONFIG.scoreBarHeight / 2
+      );
+      ctx.restore();
+    }
+
+    // Task 15.8 — Render a state-specific overlay.
+    // IDLE:      instructional prompt + prominent high score
+    // PAUSED:    "Paused" + resume prompt + current score + high score
+    // GAME_OVER: "Game Over" + final score + high score + optional "New High Score!" + restart prompt
+    // Requirements: 2.1, 2.3, 2.5, 8.1, 8.2, 8.3, 8.4, 12.3, 12.4
+    function drawOverlay() {
+      const W  = CONFIG.logicalWidth;
+      const H  = CONFIG.logicalHeight;
+      const cx = W / 2;
+
+      if (state.current === STATE.IDLE) {
+        // Semi-transparent dark veil
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.save();
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'middle';
+
+        // Game title
+        ctx.font      = '28px "Press Start 2P", monospace';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('Flappy Kiro', cx, H * 0.28);
+
+        // High score — prominent display
+        ctx.font      = '14px "Press Start 2P", monospace';
+        ctx.fillStyle = '#FFE600';
+        ctx.fillText(`Best: ${state.highScore}`, cx, H * 0.42);
+
+        // Instructional prompt
+        ctx.font      = '11px "Press Start 2P", monospace';
+        ctx.fillStyle = '#cccccc';
+        ctx.fillText('Tap or press Space', cx, H * 0.58);
+        ctx.fillText('to start', cx, H * 0.64);
+
+        ctx.restore();
+
+      } else if (state.current === STATE.PAUSED) {
+        // Semi-transparent dark veil
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.save();
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'middle';
+
+        ctx.font      = '24px "Press Start 2P", monospace';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('Paused', cx, H * 0.35);
+
+        ctx.font      = '12px "Press Start 2P", monospace';
+        ctx.fillStyle = '#aaaaaa';
+        ctx.fillText('Score: ' + state.score, cx, H * 0.48);
+        ctx.fillText('Best:  ' + state.highScore, cx, H * 0.55);
+
+        ctx.font      = '10px "Press Start 2P", monospace';
+        ctx.fillStyle = '#cccccc';
+        ctx.fillText('Esc / P to resume', cx, H * 0.67);
+
+        ctx.restore();
+
+      } else if (state.current === STATE.GAME_OVER) {
+        // Semi-transparent dark veil
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.60)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.save();
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'middle';
+
+        ctx.font      = '24px "Press Start 2P", monospace';
+        ctx.fillStyle = '#ff4444';
+        ctx.fillText('Game Over', cx, H * 0.30);
+
+        ctx.font      = '13px "Press Start 2P", monospace';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('Score: ' + state.score, cx, H * 0.43);
+        ctx.fillText('Best:  ' + state.highScore, cx, H * 0.51);
+
+        // Conditional "New High Score!" indicator
+        if (state.newHighScore) {
+          ctx.font      = '11px "Press Start 2P", monospace';
+          ctx.fillStyle = '#FFE600';
+          ctx.fillText('New High Score!', cx, H * 0.60);
+        }
+
+        ctx.font      = '10px "Press Start 2P", monospace';
+        ctx.fillStyle = '#cccccc';
+        ctx.fillText('Tap or Space to restart', cx, H * 0.72);
+
+        ctx.restore();
+      }
+    }
+
+    // Task 15.9 — Full render pipeline.
+    // Applies ctx.setTransform for logical-to-physical scaling, then
+    // ctx.translate for screen shake. Draws all layers in the correct order.
+    // Score bar and overlay are drawn AFTER ctx.restore() so they are never
+    // affected by screen shake.
+    // Requirements: 1.2, 1.3, 9.3
+    function render() {
+      // Apply logical-to-physical transform (scale + letterbox offset)
+      ctx.setTransform(state.scale, 0, 0, state.scale, state.offsetX, state.offsetY);
+
+      // Apply screen-shake translate on top of the base transform
+      ctx.save();
+      ctx.translate(state.shakeOffset.x, state.shakeOffset.y);
+
+      // ── World layers (affected by shake) ──────────────────────────────
+      drawBackground();
+      drawClouds('far');
+      drawClouds('mid');
+      drawClouds('near');
+      drawPipes();
+      drawGhosty();
+      drawParticles();
+      drawScorePopups();
+
+      // Undo shake translate — score bar and overlay are shake-free
+      ctx.restore();
+
+      // ── HUD layers (not affected by shake) ────────────────────────────
+      drawScoreBar();
+      drawOverlay();
+    }
+
+    // Module-level timestamp for delta-time computation.
+    let lastTimestamp = 0;
+
+    // Main game loop. Computes a delta-time multiplier normalised to 60fps,
+    // calls update() then render(), and schedules the next frame.
+    // rawDelta is clamped to 50ms to prevent spiral-of-death on tab switch.
+    // Requirements: 4.1
+    function gameLoop(timestamp) {
+      const rawDelta = timestamp - lastTimestamp;
+      lastTimestamp  = timestamp;
+      // Clamp to 50ms max (prevents spiral-of-death on tab switch / first frame)
+      const delta = Math.min(rawDelta, 50);
+      const dt    = delta / (1000 / 60); // normalise to 60fps multiplier
+
+      update(dt);
+      render();
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ─── INIT ────────────────────────────────────────────────────────────────
+
+    // Task 16.1 — Entry point. Sets up canvas, loads assets, initialises game
+    // state, and starts the game loop.
+    // Requirements: 1.5, 1.6, 2.1, 7.7, 8.8
+    async function init() {
+      resizeCanvas();
+      state.highScore = loadHighScore();
+      initBackgroundLines();
+      initClouds();
+      await loadGhostyImage();
+      await loadAudio();
+      state.current = STATE.IDLE;
+      requestAnimationFrame(gameLoop);
+    }
+
+    // Task 16.2 — Start the game on page load.
+    // Requirements: 1.1
+    init();
+
+    // ─── TEST EXPORTS ────────────────────────────────────────────────────────
+    // Attach pure functions to globalThis so Vitest tests can import them.
+    // In the browser these are harmless no-ops on the global object.
+    globalThis.flappyKiro = globalThis.flappyKiro || {};
+    Object.assign(globalThis.flappyKiro, {
+      updateGhosty,
+      applyFlap,
+      updateGhostyBob,
+      toPlaying,
+      toPaused,
+      toIdle,
+      handleFlap,
+      // Pipe system
+      randomGapCentre,
+      spawnPipe,
+      updatePipes,
+      checkSpeedMilestone,
+      checkScore,
+      // Collision
+      getGhostyBounds,
+      checkCollision,
+      triggerCollision,
+      // High score
+      loadHighScore,
+      saveHighScore,
+      updateHighScore,
+      // Visual effects
+      startScreenShake,
+      updateShake,
+      emitParticle,
+      updateParticles,
+      spawnScorePopup,
+      updateScorePopups,
+      // Clouds
+      initClouds,
+      updateClouds,
+      // Game loop
+      update,
+      gameLoop,
+    });
+  </script>
+</body>
+</html>
